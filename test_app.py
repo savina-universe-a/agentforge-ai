@@ -11,7 +11,9 @@ from unittest.mock import MagicMock, patch
 
 from streamlit.testing.v1 import AppTest
 
+import agent
 import planner
+from test_agent import _make_function_call_response, _make_text_response
 
 
 MOCK_PLAN = planner.ActionPlan(
@@ -174,6 +176,67 @@ class TestAgentForgeApp(unittest.TestCase):
             self.assertFalse(at.exception)
             self.assertEqual(at.subheader[0].value, section)
             self.assertEqual(len(at.info), 1)
+
+    def test_run_autonomous_agent_with_empty_goal_shows_warning(self) -> None:
+        at = AppTest.from_file("app.py").run()
+
+        at.button(key="run_agent_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.warning), 1)
+        self.assertIn("enter a goal", at.warning[0].value.lower())
+
+    def test_run_autonomous_agent_renders_activity_log_and_final_response(self) -> None:
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = [
+            _make_function_call_response([("calculate", {"expression": "18 * 5"})]),
+            _make_text_response(
+                text="18 multiplied by 5 equals 90.",
+                thought_text="HIDDEN REASONING SHOULD NOT APPEAR",
+            ),
+        ]
+
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "mock-secret-key-xyz"}, clear=False),
+            patch("agent.genai.Client", return_value=mock_client),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.text_input(key="autonomous_goal").input("Compute 18 * 5").run()
+            at.button(key="run_agent_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertFalse(at.error)
+        self.assertFalse(at.warning)
+
+        rendered_markdown = "\n".join(m.value for m in at.markdown)
+        self.assertIn("Activity Log", rendered_markdown)
+        self.assertIn("calculate", rendered_markdown)
+        self.assertIn("18 * 5 = 90", rendered_markdown)
+        self.assertIn("18 multiplied by 5 equals 90.", rendered_markdown)
+        self.assertNotIn("HIDDEN REASONING", rendered_markdown)
+        self.assertNotIn("mock-secret-key-xyz", rendered_markdown)
+
+        # Overview metrics reflect completed autonomous run in current session
+        metrics = {m.label: m.value for m in at.metric}
+        self.assertEqual(metrics["Agent Runs"], "1")
+        self.assertEqual(metrics["Tasks Completed"], "1")
+
+    def test_run_autonomous_agent_displays_error_gracefully(self) -> None:
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = RuntimeError("Service unreachable")
+
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "mock-secret-key-xyz"}, clear=False),
+            patch("agent.genai.Client", return_value=mock_client),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.text_input(key="autonomous_goal").input("Compute 18 * 5").run()
+            at.button(key="run_agent_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.error), 1)
+        self.assertIn("Service unreachable", at.error[0].value)
+        self.assertNotIn("mock-secret-key-xyz", at.error[0].value)
 
 
 if __name__ == "__main__":
