@@ -58,7 +58,7 @@ class TestPlanner(unittest.TestCase):
                 api_key="fake-test-key",
             )
 
-        mock_client_cls.assert_called_once_with(api_key="fake-test-key")
+        mock_client_cls.assert_called_once_with(api_key="fake-test-key", vertexai=False)
         call_kwargs = mock_client.models.generate_content.call_args.kwargs
         self.assertEqual(call_kwargs["model"], planner.DEFAULT_MODEL)
         self.assertIn("Launch MVP dashboard", call_kwargs["contents"])
@@ -108,6 +108,29 @@ class TestPlanner(unittest.TestCase):
                 loaded = planner.get_api_key(env_path=env_file)
 
             self.assertEqual(loaded, "local-dotenv-test-key")
+
+    def test_get_model_name_reads_from_dotenv_and_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            env_file = Path(tmp_dir) / ".env"
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(planner.get_model_name(env_path=env_file), "gemini-3.5-flash-lite")
+
+            env_file.write_text("GEMINI_MODEL=gemini-3.5-flash\n", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(planner.get_model_name(env_path=env_file), "gemini-3.5-flash")
+
+    def test_generate_action_plan_handles_503_unavailable(self) -> None:
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = genai_errors.APIError(
+            503,
+            {"error": {"message": "High demand"}},
+        )
+
+        with patch("planner.genai.Client", return_value=mock_client):
+            with self.assertRaises(planner.PlannerError) as ctx:
+                planner.generate_action_plan(goal="Plan sprint", api_key="fake-test-key")
+
+        self.assertIn("503", str(ctx.exception))
 
     def test_save_api_key_to_env_persists_key_and_validates_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

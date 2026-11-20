@@ -51,7 +51,7 @@ A clean, modular AI agent platform built with Python and Streamlit.
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `GEMINI_API_KEY` | Yes (for live planning) | — | Your private Gemini API key |
-| `GEMINI_MODEL` | No | `gemini-2.5-flash` | Supported Gemini model used for AI planning |
+| `GEMINI_MODEL` | No | `gemini-3.5-flash-lite` | Available Gemini model used for AI planning |
 
 ## Running Automated Tests
 

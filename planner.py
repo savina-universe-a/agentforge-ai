@@ -12,7 +12,7 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 Priority = Literal["High", "Medium", "Low"]
@@ -70,7 +70,7 @@ def get_api_key(override_key: str | None = None, env_path: Path | None = None) -
 
 
 def get_model_name(env_path: Path | None = None) -> str:
-    """Return the configured Gemini model name, defaulting to gemini-2.5-flash."""
+    """Return the configured Gemini model name, defaulting to gemini-3.5-flash-lite."""
     target_env = env_path if env_path is not None else ENV_FILE
     if target_env.exists():
         load_dotenv(dotenv_path=target_env, override=False)
@@ -120,7 +120,12 @@ def generate_action_plan(
     resolved_model = (model or get_model_name(env_path=env_path)).strip() or DEFAULT_MODEL
 
     try:
-        genai_client = client if client is not None else genai.Client(api_key=resolved_key)
+        # Pin vertexai=False so stray Vertex AI env vars cannot override Gemini Developer API mode.
+        genai_client = (
+            client
+            if client is not None
+            else genai.Client(api_key=resolved_key, vertexai=False)
+        )
         response = genai_client.models.generate_content(
             model=resolved_model,
             contents=f"Create a prioritized action plan for the following goal:\n\n{cleaned_goal}",
@@ -135,15 +140,21 @@ def generate_action_plan(
         status_code = getattr(exc, "code", None)
         if status_code in (401, 403):
             raise PlannerError(
-                "Gemini rejected the API key. Check that GEMINI_API_KEY is valid and active."
+                "Gemini rejected the API key (401/403). Check that GEMINI_API_KEY is valid and active."
             ) from exc
         if status_code == 429:
             raise PlannerError(
-                "Gemini API rate limit or quota was exceeded. Wait a moment or check your billing/quota settings."
+                "Gemini API rate limit or quota was exceeded (429). Wait a moment or check your billing/quota settings."
             ) from exc
         if status_code == 404:
             raise PlannerError(
-                f"Gemini model '{resolved_model}' was not found or is unavailable for your key."
+                f"Gemini model '{resolved_model}' was not found or is unavailable (404). "
+                f"Set GEMINI_MODEL in .env to an available model such as '{DEFAULT_MODEL}'."
+            ) from exc
+        if status_code == 503:
+            raise PlannerError(
+                f"Gemini model '{resolved_model}' is temporarily experiencing high demand (503). "
+                "Please try again shortly or switch GEMINI_MODEL in .env."
             ) from exc
 
         safe_detail = _sanitize_error_text(str(exc), resolved_key)

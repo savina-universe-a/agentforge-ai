@@ -162,7 +162,7 @@ class TestAgentForgeApp(unittest.TestCase):
                 at.button(key="generate_plan_btn").click().run()
 
         self.assertFalse(at.exception)
-        mock_client_cls.assert_called_once_with(api_key="session-only-fake-key")
+        mock_client_cls.assert_called_once_with(api_key="session-only-fake-key", vertexai=False)
         rendered_markdown = "\n".join(m.value for m in at.markdown)
         self.assertIn("Step 1: Finalize requirements", rendered_markdown)
 
