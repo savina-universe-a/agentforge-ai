@@ -492,18 +492,16 @@ def build_rag_prompt(question: str, sources: list[RetrievedChunk]) -> str:
     )
 
 
-def answer_question_from_knowledge_base(
+def generate_grounded_answer(
     question: str,
-    index: KnowledgeBaseIndex,
+    sources: list[RetrievedChunk],
     api_key: str | None = None,
     model: str | None = None,
-    top_k: int = DEFAULT_TOP_K,
-    min_score: float = DEFAULT_MIN_SCORE,
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     client: genai.Client | None = None,
     env_path: Path | None = None,
 ) -> RAGAnswerResult:
-    """Retrieve relevant chunks locally and ask Gemini for a strictly grounded, cited answer."""
+    """Generate a strictly grounded, cited Gemini answer from already-retrieved chunks."""
     cleaned_question = (question or "").strip()
     if not cleaned_question:
         raise ValueError("Please enter a question before querying the Knowledge Base.")
@@ -511,13 +509,10 @@ def answer_question_from_knowledge_base(
         raise ValueError(
             f"Question exceeds the maximum length of {MAX_QUESTION_LENGTH} characters."
         )
-    if index.chunk_count == 0:
-        raise ValueError("Upload at least one PDF or TXT document before asking a question.")
 
     resolved_model = (model or get_model_name(env_path=env_path)).strip() or DEFAULT_MODEL
-    retrieved = index.retrieve(cleaned_question, top_k=top_k, min_score=min_score)
 
-    if not retrieved:
+    if not sources:
         return RAGAnswerResult(
             question=cleaned_question,
             model=resolved_model,
@@ -535,7 +530,7 @@ def answer_question_from_knowledge_base(
                 "privately in the sidebar under API Configuration."
             )
 
-    prompt = build_rag_prompt(cleaned_question, retrieved)
+    prompt = build_rag_prompt(cleaned_question, sources)
     config = types.GenerateContentConfig(
         system_instruction=RAG_SYSTEM_INSTRUCTION,
         temperature=0.1,
@@ -574,6 +569,40 @@ def answer_question_from_knowledge_base(
         question=cleaned_question,
         model=resolved_model,
         answer=answer_text,
-        sources=retrieved,
+        sources=sources,
         has_evidence=True,
+    )
+
+
+def answer_question_from_knowledge_base(
+    question: str,
+    index: KnowledgeBaseIndex,
+    api_key: str | None = None,
+    model: str | None = None,
+    top_k: int = DEFAULT_TOP_K,
+    min_score: float = DEFAULT_MIN_SCORE,
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    client: genai.Client | None = None,
+    env_path: Path | None = None,
+) -> RAGAnswerResult:
+    """Retrieve relevant chunks locally via TF-IDF and ask Gemini for a grounded, cited answer."""
+    cleaned_question = (question or "").strip()
+    if not cleaned_question:
+        raise ValueError("Please enter a question before querying the Knowledge Base.")
+    if len(cleaned_question) > MAX_QUESTION_LENGTH:
+        raise ValueError(
+            f"Question exceeds the maximum length of {MAX_QUESTION_LENGTH} characters."
+        )
+    if index.chunk_count == 0:
+        raise ValueError("Upload at least one PDF or TXT document before asking a question.")
+
+    retrieved = index.retrieve(cleaned_question, top_k=top_k, min_score=min_score)
+    return generate_grounded_answer(
+        question=cleaned_question,
+        sources=retrieved,
+        api_key=api_key,
+        model=model,
+        request_timeout_seconds=request_timeout_seconds,
+        client=client,
+        env_path=env_path,
     )

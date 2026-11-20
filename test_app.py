@@ -15,8 +15,10 @@ import agent
 import database
 import planner
 import rag
+import semantic_rag
 from test_agent import _make_function_call_response, _make_text_response
 from test_database import _FakeMongoClient
+from test_semantic_rag import _FakeVectorMongoClient, _unit_vec
 
 
 MOCK_PLAN = planner.ActionPlan(
@@ -404,6 +406,97 @@ class TestAgentForgeApp(unittest.TestCase):
             rendered_markdown = "\n".join(m.value for m in at.markdown)
             self.assertIn("10 * 7 = 70", rendered_markdown)
             self.assertIn("10 multiplied by 7 equals 70.", rendered_markdown)
+
+    def test_knowledge_base_semantic_indexing_and_vector_search_flow(self) -> None:
+        ready_index = [{"name": "chunk_embedding_index", "status": "READY", "queryable": True}]
+        fake_vec_client = _FakeVectorMongoClient(search_indexes=ready_index)
+
+        mock_genai = MagicMock()
+        mock_genai.models.embed_content.side_effect = [
+            SimpleNamespace(embeddings=[SimpleNamespace(values=_unit_vec(768, 0))]),
+            SimpleNamespace(embeddings=[SimpleNamespace(values=_unit_vec(768, 0))]),
+        ]
+        mock_genai.models.generate_content.return_value = _make_text_response(
+            "Priority 1 incidents have a 2-hour SLA [sla.txt | Chunk 1]."
+        )
+
+        kb_index = rag.KnowledgeBaseIndex()
+        kb_index.add_document(
+            "sla.txt",
+            b"Support SLA: Priority 1 incidents receive an initial response within 2 hours.",
+        )
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GEMINI_API_KEY": "mock-secret-key",
+                    "MONGODB_URI": "mongodb+srv://user:pass@cluster0.example.mongodb.net/",
+                },
+                clear=False,
+            ),
+            patch("semantic_rag.MongoClient", return_value=fake_vec_client),
+            patch("semantic_rag.genai.Client", return_value=mock_genai),
+            patch("rag.genai.Client", return_value=mock_genai),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.session_state["kb_index"] = kb_index
+            at.sidebar.radio[0].set_value("Knowledge Base").run()
+
+            # Explicitly index embeddings to Atlas
+            at.button(key="kb_vector_index_btn").click().run()
+            self.assertFalse(at.exception)
+            self.assertTrue(any("embedded 1 new/changed" in s.value.lower() for s in at.success))
+
+            # Switch to Semantic Search mode and ask a question
+            at.radio(key="kb_retrieval_mode").set_value("Semantic Search (Atlas Vector)").run()
+            at.text_input(key="kb_question").input("How fast is urgent incident response?").run()
+            at.button(key="kb_ask_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertFalse(at.error)
+            self.assertFalse(at.warning)
+            rendered_markdown = "\n".join(m.value for m in at.markdown)
+            self.assertIn("2-hour SLA", rendered_markdown)
+            self.assertIn("sla.txt | Chunk 1", rendered_markdown)
+
+    def test_knowledge_base_semantic_fallback_warns_explicitly(self) -> None:
+        # Atlas Vector Search index is MISSING
+        fake_vec_client = _FakeVectorMongoClient(search_indexes=[])
+        mock_genai = MagicMock()
+        mock_genai.models.generate_content.return_value = _make_text_response(
+            "Priority 1 incidents have a 2-hour SLA [sla.txt | Chunk 1]."
+        )
+
+        kb_index = rag.KnowledgeBaseIndex()
+        kb_index.add_document(
+            "sla.txt",
+            b"Support SLA: Priority 1 incidents receive an initial response within 2 hours.",
+        )
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GEMINI_API_KEY": "mock-secret-key",
+                    "MONGODB_URI": "mongodb+srv://user:pass@cluster0.example.mongodb.net/",
+                },
+                clear=False,
+            ),
+            patch("semantic_rag.MongoClient", return_value=fake_vec_client),
+            patch("rag.genai.Client", return_value=mock_genai),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.session_state["kb_index"] = kb_index
+            at.sidebar.radio[0].set_value("Knowledge Base").run()
+            at.radio(key="kb_retrieval_mode").set_value("Semantic Search (Atlas Vector)").run()
+            at.text_input(key="kb_question").input("What is the support SLA?").run()
+            at.button(key="kb_ask_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertTrue(
+                any("local tf-idf fallback" in w.value.lower() for w in at.warning)
+            )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
-"""AgentForge AI — Milestone 5 Streamlit dashboard (Planning, Agent, Local RAG & MongoDB Atlas)."""
+"""AgentForge AI — Milestone 6 Streamlit dashboard (Planning, Agent, TF-IDF & Semantic Vector RAG)."""
 
 from __future__ import annotations
+
+import json
 
 import streamlit as st
 
@@ -34,8 +36,21 @@ from rag import (
     RAGError,
     answer_question_from_knowledge_base,
 )
+from semantic_rag import (
+    CHUNKS_COLLECTION,
+    EmbeddingError,
+    SemanticRAGResult,
+    SemanticVectorStore,
+    VectorIndexNotReadyError,
+    answer_question_semantic,
+    get_embedding_dimensions,
+    get_embedding_model_name,
+    get_vector_index_definition,
+    get_vector_index_name,
+)
 
 NAV_ITEMS = ("Overview", "AI Agent", "Knowledge Base", "Activity")
+RETRIEVAL_MODES = ("Local TF-IDF", "Semantic Search (Atlas Vector)")
 
 PRIORITY_BADGES = {
     "High": "🔴 High Priority",
@@ -65,7 +80,7 @@ def render_sidebar() -> str:
     """Render sidebar navigation, private API key controls, and persistence status."""
     with st.sidebar:
         st.markdown("## AgentForge AI")
-        st.caption("Milestone 5 · Atlas Persistence & Local RAG")
+        st.caption("Milestone 6 · Semantic RAG & Atlas Vector Search")
         st.divider()
 
         selection = st.radio(
@@ -214,7 +229,6 @@ def render_autonomous_agent_controls(
                     history.insert(0, result)
                     st.session_state["activity_history"] = history
 
-                    # Persist summary & tool activity log to MongoDB Atlas when configured
                     st.session_state.pop("agent_persistence_notice", None)
                     if is_mongodb_configured():
                         try:
@@ -253,12 +267,27 @@ def render_autonomous_agent_controls(
 
 
 def render_rag_answer(result: RAGAnswerResult) -> None:
-    """Display the grounded RAG answer and expandable retrieved Sources."""
+    """Display the grounded RAG answer, retrieval mode notice, and expandable Sources."""
     with st.container(border=True):
         st.subheader("Grounded Answer")
+
+        if isinstance(result, SemanticRAGResult):
+            if result.retrieval_mode == "tfidf_fallback":
+                st.warning(
+                    "Atlas Vector Search was unavailable — answered using **local TF-IDF fallback** "
+                    f"(not vector search). Reason: {result.fallback_reason}"
+                )
+                mode_label = "Local TF-IDF Fallback"
+            else:
+                mode_label = (
+                    f"Atlas Vector Search (`{result.index_name}`, `{result.embedding_model}`)"
+                )
+        else:
+            mode_label = "Local TF-IDF"
+
         st.caption(
             f"Question: {result.question} · Model: `{result.model}` · "
-            f"Retrieved passages: {len(result.sources)}"
+            f"Retrieval: {mode_label} · Retrieved passages: {len(result.sources)}"
         )
 
         if not result.has_evidence:
@@ -364,15 +393,15 @@ def render_ai_agent_view() -> None:
 
 
 def render_knowledge_base_view() -> None:
-    """Render the local TF-IDF Document RAG Knowledge Base with optional MongoDB Atlas persistence."""
+    """Render the Knowledge Base with TF-IDF RAG, MongoDB persistence, and Atlas Vector Search."""
     kb_index = _get_kb_index()
 
     with st.container(border=True):
         st.subheader("Knowledge Base")
         if kb_index.document_count == 0:
             st.info(
-                "No documents loaded yet. Upload PDF or TXT files below (or load previously "
-                "saved documents from MongoDB Atlas) to build the local TF-IDF retrieval index."
+                "No documents loaded in session memory yet. Upload PDF or TXT files below, "
+                "load saved documents from MongoDB Atlas, or query existing Atlas vector embeddings."
             )
         else:
             col_summary, col_clear = st.columns([3, 1])
@@ -387,6 +416,7 @@ def render_knowledge_base_view() -> None:
                     st.session_state.pop("kb_last_answer", None)
                     st.session_state.pop("kb_upload_feedback", None)
                     st.session_state.pop("kb_mongo_feedback", None)
+                    st.session_state.pop("kb_vector_feedback", None)
                     st.session_state["kb_uploader_nonce"] = (
                         st.session_state.get("kb_uploader_nonce", 0) + 1
                     )
@@ -402,16 +432,21 @@ def render_knowledge_base_view() -> None:
     st.write("")
 
     with st.container(border=True):
-        st.markdown("#### MongoDB Atlas Persistence")
+        st.markdown("#### MongoDB Atlas Persistence & Vector Embeddings")
+        embed_model = get_embedding_model_name()
+        embed_dims = get_embedding_dimensions()
+        vector_index_name = get_vector_index_name()
+        db_name = get_mongodb_db_name()
+
         if is_mongodb_configured():
             st.caption(
-                f"Configured database: `{get_mongodb_db_name()}` · "
-                "Save indexed documents to Atlas or reload saved documents into local TF-IDF retrieval."
+                f"Database: `{db_name}` · Vector collection: `{CHUNKS_COLLECTION}` · "
+                f"Index: `{vector_index_name}` · Embedding: `{embed_model}` ({embed_dims}d)"
             )
         else:
             st.caption(
                 "Session-only mode: add `MONGODB_URI` to your local `.env` file to enable "
-                "saving and reloading documents in MongoDB Atlas."
+                "MongoDB Atlas persistence and Semantic Vector Search."
             )
 
         col_verify, col_save, col_load = st.columns(3)
@@ -484,15 +519,93 @@ def render_knowledge_base_view() -> None:
                 except DatabaseError as exc:
                     st.session_state["kb_mongo_feedback"] = ("error", str(exc))
 
-        mongo_feedback = st.session_state.get("kb_mongo_feedback")
-        if isinstance(mongo_feedback, tuple) and len(mongo_feedback) == 2:
-            level, msg = mongo_feedback
-            if level == "success":
-                st.success(msg)
-            elif level == "warning":
-                st.warning(msg)
-            else:
-                st.error(msg)
+        col_vec_check, col_vec_index = st.columns(2)
+        with col_vec_check:
+            if st.button("Check Vector Index", key="kb_vector_check_btn", use_container_width=True):
+                try:
+                    with st.spinner("Checking Atlas Vector Search index status..."):
+                        with SemanticVectorStore() as store:
+                            idx_status = store.check_vector_index_status()
+                            chunk_total = store.count_indexed_chunks()
+                    if idx_status["queryable"]:
+                        st.session_state["kb_vector_feedback"] = (
+                            "success",
+                            f"Vector index `{idx_status['index_name']}` is READY on "
+                            f"`{idx_status['database']}.{idx_status['collection']}` "
+                            f"({chunk_total} embedded chunk(s)).",
+                        )
+                    elif idx_status["exists"]:
+                        st.session_state["kb_vector_feedback"] = (
+                            "warning",
+                            f"Vector index `{idx_status['index_name']}` status is "
+                            f"`{idx_status['status']}` (not ready yet). Wait a moment and re-check.",
+                        )
+                    else:
+                        st.session_state["kb_vector_feedback"] = (
+                            "warning",
+                            f"Vector index `{idx_status['index_name']}` was not found on "
+                            f"`{idx_status['database']}.{idx_status['collection']}` "
+                            f"({chunk_total} embedded chunk(s)). Create it using the setup guide below.",
+                        )
+                except DatabaseConfigError as exc:
+                    st.session_state["kb_vector_feedback"] = ("warning", str(exc))
+                except DatabaseError as exc:
+                    st.session_state["kb_vector_feedback"] = ("error", str(exc))
+
+        with col_vec_index:
+            if st.button(
+                "Index Embeddings to Atlas",
+                key="kb_vector_index_btn",
+                use_container_width=True,
+            ):
+                if kb_index.document_count == 0:
+                    st.session_state["kb_vector_feedback"] = (
+                        "warning",
+                        "Upload and index (or load) at least one document before generating embeddings.",
+                    )
+                else:
+                    try:
+                        with st.spinner(
+                            f"Embedding new/changed chunks with `{embed_model}` ({embed_dims}d)..."
+                        ):
+                            with SemanticVectorStore() as store:
+                                stats = store.index_knowledge_base(
+                                    kb_index,
+                                    api_key=_get_session_override_key(),
+                                )
+                        st.session_state["kb_vector_feedback"] = (
+                            "success",
+                            f"Vector sync complete ({stats['embedding_model']}, {stats['dimensions']}d): "
+                            f"embedded {stats['embedded']} new/changed chunk(s), "
+                            f"skipped {stats['skipped']} unchanged, "
+                            f"removed {stats['deleted_stale']} stale.",
+                        )
+                    except (MissingAPIKeyError, DatabaseConfigError, ValueError) as exc:
+                        st.session_state["kb_vector_feedback"] = ("warning", str(exc))
+                    except (EmbeddingError, DatabaseError) as exc:
+                        st.session_state["kb_vector_feedback"] = ("error", str(exc))
+
+        for feedback_key in ("kb_mongo_feedback", "kb_vector_feedback"):
+            fb = st.session_state.get(feedback_key)
+            if isinstance(fb, tuple) and len(fb) == 2:
+                level, msg = fb
+                if level == "success":
+                    st.success(msg)
+                elif level == "warning":
+                    st.warning(msg)
+                else:
+                    st.error(msg)
+
+        with st.expander("Atlas Vector Search Index Setup JSON", expanded=False):
+            st.caption(
+                f"In MongoDB Atlas → **Search & Vector Search** → **Create Vector Search Index** → "
+                f"**JSON Editor**, select database `{db_name}`, collection `{CHUNKS_COLLECTION}`, "
+                f"name the index `{vector_index_name}`, and paste:"
+            )
+            st.code(
+                json.dumps(get_vector_index_definition(embed_dims), indent=2),
+                language="json",
+            )
 
     st.write("")
 
@@ -546,10 +659,30 @@ def render_knowledge_base_view() -> None:
 
     with st.container(border=True):
         st.markdown("#### Ask a Question")
-        st.caption(
-            "Local TF-IDF retrieves the most relevant passages and sends only those excerpts to "
-            "Gemini for a grounded, cited answer."
+        retrieval_mode = st.radio(
+            "Retrieval Mode",
+            options=RETRIEVAL_MODES,
+            index=0,
+            horizontal=True,
+            key="kb_retrieval_mode",
         )
+
+        allow_tfidf_fallback = True
+        if retrieval_mode == "Semantic Search (Atlas Vector)":
+            st.caption(
+                "Embeds your question with Gemini (`RETRIEVAL_QUERY`), retrieves top matching "
+                "passages via MongoDB Atlas `$vectorSearch`, and generates a grounded, cited answer."
+            )
+            allow_tfidf_fallback = st.checkbox(
+                "Fall back to local TF-IDF if Atlas Vector Search is unavailable",
+                value=True,
+                key="kb_allow_tfidf_fallback",
+            )
+        else:
+            st.caption(
+                "Local TF-IDF retrieves the most relevant passages in session memory and sends "
+                "only those excerpts to Gemini for a grounded, cited answer."
+            )
 
         question = st.text_input(
             "Question",
@@ -560,22 +693,37 @@ def render_knowledge_base_view() -> None:
         if st.button("Ask Knowledge Base", type="primary", key="kb_ask_btn"):
             if not question.strip():
                 st.warning("Please enter a question before querying the Knowledge Base.")
-            elif kb_index.chunk_count == 0:
-                st.warning("Upload and index at least one PDF or TXT document first.")
+            elif retrieval_mode == "Local TF-IDF":
+                if kb_index.chunk_count == 0:
+                    st.warning("Upload and index at least one PDF or TXT document first.")
+                else:
+                    try:
+                        with st.spinner("Retrieving passages (TF-IDF) and generating grounded answer..."):
+                            result = answer_question_from_knowledge_base(
+                                question=question,
+                                index=kb_index,
+                                api_key=_get_session_override_key(),
+                            )
+                        st.session_state["kb_last_answer"] = result
+                    except (MissingAPIKeyError, ValueError) as exc:
+                        st.warning(str(exc))
+                    except RAGError as exc:
+                        st.error(str(exc))
             else:
                 try:
-                    with st.spinner("Retrieving passages and generating grounded answer..."):
-                        result = answer_question_from_knowledge_base(
+                    with st.spinner(
+                        "Searching Atlas Vector Index and generating grounded answer..."
+                    ):
+                        result = answer_question_semantic(
                             question=question,
-                            index=kb_index,
+                            fallback_index=kb_index,
+                            allow_tfidf_fallback=allow_tfidf_fallback,
                             api_key=_get_session_override_key(),
                         )
                     st.session_state["kb_last_answer"] = result
-                except MissingAPIKeyError as exc:
+                except (MissingAPIKeyError, DatabaseConfigError, VectorIndexNotReadyError, ValueError) as exc:
                     st.warning(str(exc))
-                except ValueError as exc:
-                    st.warning(str(exc))
-                except RAGError as exc:
+                except (EmbeddingError, DatabaseError, RAGError) as exc:
                     st.error(str(exc))
 
     last_answer = st.session_state.get("kb_last_answer")
@@ -645,7 +793,7 @@ def main() -> None:
 
     st.title("AgentForge AI")
     st.caption(
-        "AI agent platform for Gemini planning, autonomous tool calling, local TF-IDF RAG, "
+        "AI agent platform for Gemini planning, autonomous tool calling, TF-IDF & Semantic Vector RAG, "
         "and MongoDB Atlas persistence."
     )
     st.divider()
