@@ -1,4 +1,4 @@
-"""AgentForge AI — Milestone 3 Streamlit dashboard with AI planning & autonomous tool-calling agent."""
+"""AgentForge AI — Milestone 4 Streamlit dashboard (Planning, Autonomous Agent & Local RAG)."""
 
 from __future__ import annotations
 
@@ -19,6 +19,14 @@ from planner import (
     get_model_name,
     save_api_key_to_env,
 )
+from rag import (
+    MAX_FILE_SIZE_BYTES,
+    DocumentIngestionError,
+    KnowledgeBaseIndex,
+    RAGAnswerResult,
+    RAGError,
+    answer_question_from_knowledge_base,
+)
 
 NAV_ITEMS = ("Overview", "AI Agent", "Knowledge Base", "Activity")
 
@@ -37,11 +45,20 @@ def _get_session_override_key() -> str | None:
     return candidate or None
 
 
+def _get_kb_index() -> KnowledgeBaseIndex:
+    """Return the session-only in-memory KnowledgeBaseIndex."""
+    index = st.session_state.get("kb_index")
+    if not isinstance(index, KnowledgeBaseIndex):
+        index = KnowledgeBaseIndex()
+        st.session_state["kb_index"] = index
+    return index
+
+
 def render_sidebar() -> str:
     """Render sidebar navigation and private local API key controls."""
     with st.sidebar:
         st.markdown("## AgentForge AI")
-        st.caption("Milestone 3 · Autonomous Tool-Calling Agent")
+        st.caption("Milestone 4 · Planning, Agent & Document RAG")
         st.divider()
 
         selection = st.radio(
@@ -198,10 +215,37 @@ def render_autonomous_agent_controls(
         render_agent_result(last_result)
 
 
+def render_rag_answer(result: RAGAnswerResult) -> None:
+    """Display the grounded RAG answer and expandable retrieved Sources."""
+    with st.container(border=True):
+        st.subheader("Grounded Answer")
+        st.caption(
+            f"Question: {result.question} · Model: `{result.model}` · "
+            f"Retrieved passages: {len(result.sources)}"
+        )
+
+        if not result.has_evidence:
+            st.warning(result.answer)
+        else:
+            st.markdown(result.answer)
+
+        with st.expander(f"Sources ({len(result.sources)} retrieved passage(s))", expanded=False):
+            if not result.sources:
+                st.caption("No document passages met the minimum relevance threshold.")
+            else:
+                for item in result.sources:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**[{item.chunk.citation_label}]** — Relevance: `{item.score:.2f}`"
+                        )
+                        st.write(item.chunk.text)
+
+
 def render_overview() -> None:
     """Render the Overview dashboard with metrics, AI planning, and Autonomous Agent."""
     agent_runs = st.session_state.get("agent_runs", 0)
     tasks_completed = st.session_state.get("tasks_completed", 0)
+    document_count = _get_kb_index().document_count
 
     col_runs, col_docs, col_tasks = st.columns(3)
 
@@ -211,7 +255,7 @@ def render_overview() -> None:
 
     with col_docs:
         with st.container(border=True):
-            st.metric(label="Documents", value=0)
+            st.metric(label="Documents", value=document_count)
 
     with col_tasks:
         with st.container(border=True):
@@ -282,6 +326,131 @@ def render_ai_agent_view() -> None:
     )
 
 
+def render_knowledge_base_view() -> None:
+    """Render the Milestone 4 local TF-IDF Document RAG Knowledge Base view."""
+    kb_index = _get_kb_index()
+
+    with st.container(border=True):
+        st.subheader("Knowledge Base")
+        if kb_index.document_count == 0:
+            st.info(
+                "No documents uploaded yet. Upload PDF or TXT files below to build an "
+                "in-memory TF-IDF knowledge base for this session (files are never written to disk)."
+            )
+        else:
+            col_summary, col_clear = st.columns([3, 1])
+            with col_summary:
+                st.caption(
+                    f"Indexed in session memory: **{kb_index.document_count}** document(s), "
+                    f"**{kb_index.chunk_count}** overlapping chunk(s)."
+                )
+            with col_clear:
+                if st.button("Clear Knowledge Base", key="kb_clear_btn", use_container_width=True):
+                    kb_index.clear()
+                    st.session_state.pop("kb_last_answer", None)
+                    st.session_state.pop("kb_upload_feedback", None)
+                    st.session_state["kb_uploader_nonce"] = (
+                        st.session_state.get("kb_uploader_nonce", 0) + 1
+                    )
+                    st.rerun()
+
+            for doc in kb_index.documents:
+                size_kb = max(doc.size_bytes / 1024, 0.1)
+                page_info = f"{doc.page_count} page(s)" if doc.file_type == "pdf" else "TXT"
+                st.markdown(
+                    f"- **{doc.doc_name}** (`{page_info}`, {doc.chunk_count} chunk(s), {size_kb:.1f} KB)"
+                )
+
+    st.write("")
+
+    with st.container(border=True):
+        st.markdown("#### Upload Documents")
+        max_mb = MAX_FILE_SIZE_BYTES / (1024 * 1024)
+        st.caption(
+            f"Upload PDF or TXT files (max {max_mb:.0f} MB each). Text and retrieval index live "
+            "only in your browser session memory."
+        )
+
+        uploader_nonce = st.session_state.get("kb_uploader_nonce", 0)
+        uploaded_files = st.file_uploader(
+            "Select PDF or TXT documents",
+            type=["pdf", "txt"],
+            accept_multiple_files=True,
+            key=f"kb_uploader_{uploader_nonce}",
+        )
+
+        if st.button("Index Uploaded Documents", key="kb_index_btn"):
+            if not uploaded_files:
+                st.warning("Select at least one PDF or TXT file before indexing.")
+            else:
+                indexed_names: list[str] = []
+                errors: list[str] = []
+                for uploaded in uploaded_files:
+                    try:
+                        record = kb_index.add_document(uploaded.name, uploaded.getvalue())
+                        indexed_names.append(f"{record.doc_name} ({record.chunk_count} chunks)")
+                    except DocumentIngestionError as exc:
+                        errors.append(str(exc))
+
+                if indexed_names:
+                    st.session_state.pop("kb_last_answer", None)
+                st.session_state["kb_upload_feedback"] = {
+                    "indexed": indexed_names,
+                    "errors": errors,
+                }
+                st.rerun()
+
+        feedback = st.session_state.get("kb_upload_feedback")
+        if isinstance(feedback, dict):
+            indexed_list = feedback.get("indexed") or []
+            error_list = feedback.get("errors") or []
+            if indexed_list:
+                st.success(f"Indexed: {', '.join(indexed_list)}")
+            for err in error_list:
+                st.error(err)
+
+    st.write("")
+
+    with st.container(border=True):
+        st.markdown("#### Ask a Question")
+        st.caption(
+            "Local TF-IDF retrieves the most relevant passages and sends only those excerpts to "
+            "Gemini for a grounded, cited answer."
+        )
+
+        question = st.text_input(
+            "Question",
+            placeholder="Ask a question about your uploaded documents...",
+            key="kb_question",
+        )
+
+        if st.button("Ask Knowledge Base", type="primary", key="kb_ask_btn"):
+            if not question.strip():
+                st.warning("Please enter a question before querying the Knowledge Base.")
+            elif kb_index.chunk_count == 0:
+                st.warning("Upload and index at least one PDF or TXT document first.")
+            else:
+                try:
+                    with st.spinner("Retrieving passages and generating grounded answer..."):
+                        result = answer_question_from_knowledge_base(
+                            question=question,
+                            index=kb_index,
+                            api_key=_get_session_override_key(),
+                        )
+                    st.session_state["kb_last_answer"] = result
+                except MissingAPIKeyError as exc:
+                    st.warning(str(exc))
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except RAGError as exc:
+                    st.error(str(exc))
+
+    last_answer = st.session_state.get("kb_last_answer")
+    if isinstance(last_answer, RAGAnswerResult):
+        st.write("")
+        render_rag_answer(last_answer)
+
+
 def render_activity_view() -> None:
     """Render the Activity view showing autonomous agent runs from the current session."""
     history: list[AgentRunResult] = st.session_state.get("activity_history", [])
@@ -299,13 +468,6 @@ def render_activity_view() -> None:
         render_agent_result(run)
 
 
-def render_placeholder(title: str, description: str) -> None:
-    """Render a minimal placeholder view for upcoming platform sections."""
-    with st.container(border=True):
-        st.subheader(title)
-        st.info(description)
-
-
 def main() -> None:
     """Configure the page and render the selected section."""
     st.set_page_config(
@@ -319,7 +481,7 @@ def main() -> None:
 
     st.title("AgentForge AI")
     st.caption(
-        "AI agent platform for Gemini AI planning, autonomous tool calling, and future RAG workflows."
+        "AI agent platform for Gemini AI planning, autonomous tool calling, and local document RAG."
     )
     st.divider()
 
@@ -328,10 +490,7 @@ def main() -> None:
     elif selected_section == "AI Agent":
         render_ai_agent_view()
     elif selected_section == "Knowledge Base":
-        render_placeholder(
-            "Knowledge Base",
-            "Coming soon: Upload and index documents for retrieval-augmented generation (RAG) with pgvector.",
-        )
+        render_knowledge_base_view()
     elif selected_section == "Activity":
         render_activity_view()
 

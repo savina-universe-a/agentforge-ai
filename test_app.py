@@ -13,6 +13,7 @@ from streamlit.testing.v1 import AppTest
 
 import agent
 import planner
+import rag
 from test_agent import _make_function_call_response, _make_text_response
 
 
@@ -237,6 +238,77 @@ class TestAgentForgeApp(unittest.TestCase):
         self.assertEqual(len(at.error), 1)
         self.assertIn("Service unreachable", at.error[0].value)
         self.assertNotIn("mock-secret-key-xyz", at.error[0].value)
+
+    def test_knowledge_base_empty_query_warns_user(self) -> None:
+        at = AppTest.from_file("app.py").run()
+        at.sidebar.radio[0].set_value("Knowledge Base").run()
+        at.text_input(key="kb_question").input("What is the refund policy?").run()
+        at.button(key="kb_ask_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.warning), 1)
+        self.assertIn("upload and index", at.warning[0].value.lower())
+
+    def test_knowledge_base_grounded_answer_sources_and_clear_flow(self) -> None:
+        kb_index = rag.KnowledgeBaseIndex()
+        kb_index.add_document(
+            "warranty.txt",
+            b"Hardware Warranty: All devices include a 24-month limited hardware warranty.",
+        )
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = _make_text_response(
+            text="All devices include a 24-month limited hardware warranty [warranty.txt | Chunk 1]."
+        )
+
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "mock-rag-key"}, clear=False),
+            patch("rag.genai.Client", return_value=mock_client),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.session_state["kb_index"] = kb_index
+            at.run()
+
+            # Overview Documents metric reflects in-memory Knowledge Base count
+            metrics = {m.label: m.value for m in at.metric}
+            self.assertEqual(metrics["Documents"], "1")
+
+            # Switch to Knowledge Base and ask a grounded question
+            at.sidebar.radio[0].set_value("Knowledge Base").run()
+            at.text_input(key="kb_question").input("How long is the hardware warranty?").run()
+            at.button(key="kb_ask_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertFalse(at.error)
+
+            rendered_markdown = "\n".join(m.value for m in at.markdown)
+            self.assertIn("24-month limited hardware warranty", rendered_markdown)
+            self.assertIn("warranty.txt | Chunk 1", rendered_markdown)
+
+            # Expandable Sources section contains the retrieved passage
+            self.assertTrue(any("Sources" in exp.label for exp in at.expander))
+
+            # Clear Knowledge Base removes documents from session state
+            at.button(key="kb_clear_btn").click().run()
+            self.assertFalse(at.exception)
+            self.assertEqual(at.session_state["kb_index"].document_count, 0)
+
+    def test_knowledge_base_missing_evidence_shows_explicit_notice(self) -> None:
+        kb_index = rag.KnowledgeBaseIndex()
+        kb_index.add_document(
+            "warranty.txt",
+            b"Hardware Warranty: All devices include a 24-month limited hardware warranty.",
+        )
+
+        at = AppTest.from_file("app.py").run()
+        at.session_state["kb_index"] = kb_index
+        at.sidebar.radio[0].set_value("Knowledge Base").run()
+        at.text_input(key="kb_question").input("What is the cafeteria pizza price?").run()
+        at.button(key="kb_ask_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.warning), 1)
+        self.assertIn("do not contain", at.warning[0].value.lower())
 
 
 if __name__ == "__main__":
