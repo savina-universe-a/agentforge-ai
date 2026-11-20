@@ -13,11 +13,13 @@ from streamlit.testing.v1 import AppTest
 
 import agent
 import database
+import multi_agent
 import planner
 import rag
 import semantic_rag
 from test_agent import _make_function_call_response, _make_text_response
 from test_database import _FakeMongoClient
+from test_multi_agent import _make_routing_response
 from test_semantic_rag import _FakeVectorMongoClient, _unit_vec
 
 
@@ -497,6 +499,73 @@ class TestAgentForgeApp(unittest.TestCase):
             self.assertTrue(
                 any("local tf-idf fallback" in w.value.lower() for w in at.warning)
             )
+
+    def test_ai_agent_page_multi_agent_empty_task_warns(self) -> None:
+        at = AppTest.from_file("app.py").run()
+        at.sidebar.radio[0].set_value("AI Agent").run()
+        at.button(key="run_multi_agent_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertTrue(any("enter a task" in w.value.lower() for w in at.warning))
+
+    def test_ai_agent_page_multi_agent_workflow_trace_citations_and_activity_reload(self) -> None:
+        fake_mongo = _FakeMongoClient()
+        kb_index = rag.KnowledgeBaseIndex()
+        kb_index.add_document(
+            "sla.txt",
+            b"Support SLA: Priority 1 incidents receive a response within 2 hours and $250 breach credit.",
+        )
+
+        mock_genai = MagicMock()
+        mock_genai.models.generate_content.side_effect = [
+            _make_routing_response("research_and_analysis", research_query="Priority 1 breach credit"),
+            _make_function_call_response([("calculate", {"expression": "250 * 2"})]),
+            _make_text_response("2 breaches cost 500."),
+            _make_text_response("Breach credit is $250 [sla.txt | Chunk 1], totaling $500 for 2 breaches."),
+        ]
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GEMINI_API_KEY": "mock-secret-key",
+                    "MONGODB_URI": "mongodb+srv://user:pass@cluster0.example.mongodb.net/",
+                },
+                clear=False,
+            ),
+            patch("multi_agent.genai.Client", return_value=mock_genai),
+            patch("database.MongoClient", return_value=fake_mongo),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.session_state["kb_index"] = kb_index
+            at.sidebar.radio[0].set_value("AI Agent").run()
+            at.checkbox(key="multi_agent_prefer_semantic").set_value(False).run()
+            at.text_input(key="multi_agent_task").input(
+                "Look up SLA breach credit and calculate total for 2 breaches."
+            ).run()
+            at.button(key="run_multi_agent_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertFalse(at.error)
+            rendered_md = "\n".join(m.value for m in at.markdown)
+            self.assertIn("Agent Execution Trace", rendered_md)
+            self.assertIn("Research Agent", rendered_md)
+            self.assertIn("Analysis Agent", rendered_md)
+            self.assertIn("Writer Agent", rendered_md)
+            self.assertIn("$500", rendered_md)
+            self.assertIn("sla.txt | Chunk 1", rendered_md)
+            self.assertTrue(any("workflow_runs" in s.value for s in at.success))
+
+            # Clear local workflow history and reload from Activity tab via MongoDB
+            at.session_state["workflow_history"] = []
+            at.sidebar.radio[0].set_value("Activity").run()
+            at.button(key="activity_workflow_load_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertEqual(len(at.session_state["workflow_history"]), 1)
+            activity_md = "\n".join(m.value for m in at.markdown)
+            self.assertIn("Multi-Agent Workflow History", activity_md)
+            self.assertIn("$500", activity_md)
 
 
 if __name__ == "__main__":

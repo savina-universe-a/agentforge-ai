@@ -19,6 +19,14 @@ from database import (
     get_mongodb_db_name,
     is_mongodb_configured,
 )
+from multi_agent import (
+    DEFAULT_MAX_API_CALLS,
+    DEFAULT_MAX_STEPS,
+    MultiAgentResult,
+    WorkflowError,
+    WorkflowTraceStep,
+    run_multi_agent_workflow,
+)
 from planner import (
     ActionPlan,
     MissingAPIKeyError,
@@ -80,7 +88,7 @@ def render_sidebar() -> str:
     """Render sidebar navigation, private API key controls, and persistence status."""
     with st.sidebar:
         st.markdown("## AgentForge AI")
-        st.caption("Milestone 6 · Semantic RAG & Atlas Vector Search")
+        st.caption("Milestone 7 · LangGraph Multi-Agent & Semantic RAG")
         st.divider()
 
         selection = st.radio(
@@ -375,20 +383,141 @@ def render_overview() -> None:
     )
 
 
+def render_multi_agent_result(result: MultiAgentResult) -> None:
+    """Display the LangGraph multi-agent execution trace, final response, and citations."""
+    with st.container(border=True):
+        st.subheader("Multi-Agent Workflow Result")
+        st.caption(
+            f"Task: {result.task} · Route: `{result.route}` · Model: `{result.model}` · "
+            f"Steps: {result.steps_taken}/{result.max_steps} · "
+            f"API Calls: {result.api_calls_used}/{result.max_api_calls} · "
+            f"Retrieval: `{result.retrieval_mode}`"
+        )
+
+        if result.stopped_reason != "completed":
+            st.warning(f"Workflow stopped early: `{result.stopped_reason}`.")
+
+        for note in result.fallback_notes:
+            st.warning(f"Fallback used: {note}")
+
+        if result.persistence_notice:
+            if result.persisted_workflow_id:
+                st.success(result.persistence_notice)
+            else:
+                st.warning(result.persistence_notice)
+
+        st.markdown("#### Agent Execution Trace")
+        status_icons = {
+            "ok": "✅",
+            "fallback": "⚠️ Fallback",
+            "retry": "🔁 Retry",
+            "limit": "🛑 Limit",
+            "error": "❌ Error",
+        }
+        for entry in result.trace:
+            badge = status_icons.get(entry.status, entry.status)
+            with st.container(border=True):
+                st.markdown(
+                    f"**Step {entry.step} · {entry.agent}** — `{entry.action}` ({badge})"
+                )
+                st.write(entry.detail)
+
+        st.divider()
+        st.markdown("#### Final Response")
+        st.markdown(result.final_response)
+
+        if result.citations or result.evidence:
+            with st.expander(
+                f"Citations & Retrieved Evidence ({len(result.citations)} source(s))",
+                expanded=False,
+            ):
+                if result.evidence:
+                    for item in result.evidence:
+                        with st.container(border=True):
+                            st.markdown(
+                                f"**[{item.chunk.citation_label}]** — Relevance: `{item.score:.2f}`"
+                            )
+                            st.write(item.chunk.text)
+                else:
+                    for cite in result.citations:
+                        st.markdown(f"- `[{cite}]`")
+
+
+def render_multi_agent_controls() -> None:
+    """Render the Milestone 7 LangGraph Multi-Agent Workflow section on the AI Agent page."""
+    with st.container(border=True):
+        st.subheader("Multi-Agent Workflow (LangGraph)")
+        st.caption(
+            "Dynamic Supervisor routing across **Research Agent** (Atlas Vector / TF-IDF RAG), "
+            "**Analysis Agent** (safe math, datetime, planning tools), and **Writer Agent** "
+            f"(grounded citations). Bounded to {DEFAULT_MAX_STEPS} graph steps and "
+            f"{DEFAULT_MAX_API_CALLS} Gemini API calls."
+        )
+
+        wf_task = st.text_input(
+            "Multi-Agent Task",
+            placeholder="e.g., Look up our SLA policy, calculate total penalty for 3 breaches at $250 each, and write a brief summary...",
+            key="multi_agent_task",
+        )
+
+        prefer_semantic = st.checkbox(
+            "Prefer Atlas Vector Search for Research Agent (falls back explicitly to local TF-IDF)",
+            value=True,
+            key="multi_agent_prefer_semantic",
+        )
+
+        if st.button("Run Multi-Agent Workflow", type="primary", key="run_multi_agent_btn"):
+            if not wf_task.strip():
+                st.warning("Please enter a task before running the multi-agent workflow.")
+            else:
+                try:
+                    with st.spinner("Running LangGraph multi-agent workflow..."):
+                        wf_result = run_multi_agent_workflow(
+                            task=wf_task,
+                            knowledge_base=_get_kb_index(),
+                            prefer_semantic=prefer_semantic,
+                            api_key=_get_session_override_key(),
+                        )
+                    st.session_state["last_workflow_result"] = wf_result
+                    st.session_state["agent_runs"] = st.session_state.get("agent_runs", 0) + 1
+                    if wf_result.stopped_reason == "completed":
+                        st.session_state["tasks_completed"] = (
+                            st.session_state.get("tasks_completed", 0) + 1
+                        )
+                    wf_history: list[MultiAgentResult] = list(
+                        st.session_state.get("workflow_history", [])
+                    )
+                    wf_history.insert(0, wf_result)
+                    st.session_state["workflow_history"] = wf_history
+                    st.rerun()
+                except (MissingAPIKeyError, ValueError) as exc:
+                    st.warning(str(exc))
+                except WorkflowError as exc:
+                    st.error(str(exc))
+
+    last_wf = st.session_state.get("last_workflow_result")
+    if isinstance(last_wf, MultiAgentResult):
+        st.write("")
+        render_multi_agent_result(last_wf)
+
+
 def render_ai_agent_view() -> None:
-    """Render the dedicated AI Agent workspace."""
+    """Render the dedicated AI Agent workspace (LangGraph Multi-Agent + Single Autonomous Agent)."""
     with st.container(border=True):
         st.subheader("AI Agent")
         st.info(
-            "Autonomous Gemini tool-calling agent (bounded to 5 iterations). "
-            "Available safe tools: `calculate`, `get_current_datetime`, and `create_action_plan`."
+            "Run either the **LangGraph Multi-Agent Workflow** (Supervisor + Research, Analysis, "
+            "and Writer agents) or the **Single Autonomous Tool-Calling Agent** below."
         )
+
+    st.write("")
+    render_multi_agent_controls()
 
     st.write("")
     render_autonomous_agent_controls(
         input_key="ai_agent_view_goal",
         button_key="ai_agent_view_run_btn",
-        show_header=False,
+        show_header=True,
     )
 
 
@@ -733,37 +862,91 @@ def render_knowledge_base_view() -> None:
 
 
 def render_activity_view() -> None:
-    """Render the Activity view showing session and optionally persisted MongoDB agent runs."""
+    """Render the Activity view showing single-agent runs and multi-agent workflow history."""
     history: list[AgentRunResult] = st.session_state.get("activity_history", [])
+    wf_history: list[MultiAgentResult] = st.session_state.get("workflow_history", [])
+
     with st.container(border=True):
         st.subheader("Activity")
-        if not history:
+        if not history and not wf_history:
             st.info(
-                "No autonomous agent runs loaded in this session yet. "
-                "Run the Autonomous Agent or load saved activity from MongoDB Atlas below."
+                "No agent or multi-agent workflow runs loaded in this session yet. "
+                "Run an agent or load saved history from MongoDB Atlas below."
             )
 
-        if st.button("Load Saved Activity from MongoDB", key="activity_mongo_load_btn"):
-            try:
-                with st.spinner("Loading saved agent activity from MongoDB Atlas..."):
-                    with MongoPersistence() as db:
-                        saved_runs = db.load_agent_runs(limit=20)
-                if not saved_runs:
-                    st.session_state["activity_mongo_feedback"] = (
-                        "warning",
-                        "No saved agent runs found in MongoDB Atlas yet.",
-                    )
-                else:
-                    st.session_state["activity_history"] = saved_runs
-                    st.session_state["activity_mongo_feedback"] = (
-                        "success",
-                        f"Loaded {len(saved_runs)} saved agent run(s) from MongoDB Atlas.",
-                    )
-                    st.rerun()
-            except DatabaseConfigError as exc:
-                st.session_state["activity_mongo_feedback"] = ("warning", str(exc))
-            except DatabaseError as exc:
-                st.session_state["activity_mongo_feedback"] = ("error", str(exc))
+        col_load_agent, col_load_wf = st.columns(2)
+        with col_load_agent:
+            if st.button(
+                "Load Saved Activity from MongoDB",
+                key="activity_mongo_load_btn",
+                use_container_width=True,
+            ):
+                try:
+                    with st.spinner("Loading saved agent activity from MongoDB Atlas..."):
+                        with MongoPersistence() as db:
+                            saved_runs = db.load_agent_runs(limit=20)
+                    if not saved_runs:
+                        st.session_state["activity_mongo_feedback"] = (
+                            "warning",
+                            "No saved agent runs found in MongoDB Atlas yet.",
+                        )
+                    else:
+                        st.session_state["activity_history"] = saved_runs
+                        st.session_state["activity_mongo_feedback"] = (
+                            "success",
+                            f"Loaded {len(saved_runs)} saved agent run(s) from MongoDB Atlas.",
+                        )
+                        st.rerun()
+                except DatabaseConfigError as exc:
+                    st.session_state["activity_mongo_feedback"] = ("warning", str(exc))
+                except DatabaseError as exc:
+                    st.session_state["activity_mongo_feedback"] = ("error", str(exc))
+
+        with col_load_wf:
+            if st.button(
+                "Load Saved Workflows from MongoDB",
+                key="activity_workflow_load_btn",
+                use_container_width=True,
+            ):
+                try:
+                    with st.spinner("Loading saved multi-agent workflows from MongoDB Atlas..."):
+                        with MongoPersistence() as db:
+                            raw_workflows = db.load_workflow_runs(limit=20)
+                    if not raw_workflows:
+                        st.session_state["activity_mongo_feedback"] = (
+                            "warning",
+                            "No saved multi-agent workflows found in MongoDB Atlas yet.",
+                        )
+                    else:
+                        loaded_wfs = [
+                            MultiAgentResult(
+                                task=item["task"],
+                                model=item["model"],
+                                route=item["route"],
+                                final_response=item["final_response"],
+                                citations=item["citations"],
+                                retrieval_mode=item["retrieval_mode"],
+                                fallback_notes=item["fallback_notes"],
+                                trace=[WorkflowTraceStep(**t) for t in item["trace"]],
+                                steps_taken=item["steps_taken"],
+                                max_steps=item["max_steps"],
+                                api_calls_used=item["api_calls_used"],
+                                max_api_calls=item["max_api_calls"],
+                                stopped_reason=item["stopped_reason"],
+                                persisted_workflow_id=item.get("workflow_id") or None,
+                            )
+                            for item in raw_workflows
+                        ]
+                        st.session_state["workflow_history"] = loaded_wfs
+                        st.session_state["activity_mongo_feedback"] = (
+                            "success",
+                            f"Loaded {len(loaded_wfs)} saved multi-agent workflow(s) from MongoDB Atlas.",
+                        )
+                        st.rerun()
+                except DatabaseConfigError as exc:
+                    st.session_state["activity_mongo_feedback"] = ("warning", str(exc))
+                except DatabaseError as exc:
+                    st.session_state["activity_mongo_feedback"] = ("error", str(exc))
 
         activity_feedback = st.session_state.get("activity_mongo_feedback")
         if isinstance(activity_feedback, tuple) and len(activity_feedback) == 2:
@@ -775,9 +958,19 @@ def render_activity_view() -> None:
             else:
                 st.error(msg)
 
-    for run in history:
+    if wf_history:
         st.write("")
-        render_agent_result(run)
+        st.markdown("### Multi-Agent Workflow History")
+        for wf in wf_history:
+            st.write("")
+            render_multi_agent_result(wf)
+
+    if history:
+        st.write("")
+        st.markdown("### Autonomous Agent History")
+        for run in history:
+            st.write("")
+            render_agent_result(run)
 
 
 def main() -> None:

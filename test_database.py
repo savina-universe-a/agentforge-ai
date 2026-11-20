@@ -84,6 +84,7 @@ class _FakeMongoClient:
             self._dbs[db_name] = {
                 database.DOCUMENTS_COLLECTION: _InMemoryCollection(),
                 database.AGENT_RUNS_COLLECTION: _InMemoryCollection(),
+                database.WORKFLOW_RUNS_COLLECTION: _InMemoryCollection(),
             }
         return self._dbs[db_name]
 

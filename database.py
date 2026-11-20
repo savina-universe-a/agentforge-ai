@@ -34,6 +34,7 @@ from rag import (
 DEFAULT_DB_NAME = "agentforge_ai"
 DOCUMENTS_COLLECTION = "documents"
 AGENT_RUNS_COLLECTION = "agent_runs"
+WORKFLOW_RUNS_COLLECTION = "workflow_runs"
 DEFAULT_TIMEOUT_MS = 5_000
 
 _MONGO_CREDENTIAL_PATTERN = re.compile(r"(mongodb(?:\+srv)?://)([^@\s/]+)@", re.IGNORECASE)
@@ -196,6 +197,7 @@ class MongoPersistence:
         self._db = self._client[self.db_name]
         self._documents = self._db[DOCUMENTS_COLLECTION]
         self._agent_runs = self._db[AGENT_RUNS_COLLECTION]
+        self._workflow_runs = self._db[WORKFLOW_RUNS_COLLECTION]
 
     def close(self) -> None:
         """Close the MongoClient if owned by this persistence instance."""
@@ -431,5 +433,94 @@ class MongoPersistence:
             raise DatabaseError(_format_mongo_error(exc, self._uri)) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise DatabaseError("Persisted agent run record in MongoDB has an unexpected format.") from exc
+
+        return runs
+
+    def save_workflow_run(self, workflow_payload: dict[str, Any]) -> str:
+        """Persist a completed multi-agent LangGraph workflow trace and response safely."""
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat(timespec="seconds")
+        task_text = str(workflow_payload.get("task", ""))
+        route_text = str(workflow_payload.get("route", ""))
+        trace_items = list(workflow_payload.get("trace", []))
+
+        digest = hashlib.sha256(
+            f"{now_utc.isoformat()}|{task_text}|{route_text}|{len(trace_items)}".encode("utf-8")
+        ).hexdigest()[:16]
+        workflow_id = f"wf:{now_utc.strftime('%Y%m%dT%H%M%SZ')}:{digest}"
+
+        safe_trace = [
+            {
+                "step": int(item.get("step", idx)),
+                "agent": str(item.get("agent", "unknown")),
+                "action": _redact_sensitive_text(str(item.get("action", "")), self._uri),
+                "status": str(item.get("status", "ok")),
+                "detail": _redact_sensitive_text(str(item.get("detail", "")), self._uri),
+            }
+            for idx, item in enumerate(trace_items, start=1)
+        ]
+
+        safe_doc: dict[str, Any] = {
+            "_id": workflow_id,
+            "task": _redact_sensitive_text(task_text, self._uri),
+            "model": str(workflow_payload.get("model", "")),
+            "route": route_text,
+            "retrieval_mode": str(workflow_payload.get("retrieval_mode", "not_needed")),
+            "fallback_notes": [
+                _redact_sensitive_text(str(note), self._uri)
+                for note in workflow_payload.get("fallback_notes", [])
+            ],
+            "citations": [
+                _redact_sensitive_text(str(c), self._uri)
+                for c in workflow_payload.get("citations", [])
+            ],
+            "final_response": _redact_sensitive_text(
+                str(workflow_payload.get("final_response", "")), self._uri
+            ),
+            "steps_taken": int(workflow_payload.get("steps_taken", 0)),
+            "max_steps": int(workflow_payload.get("max_steps", 0)),
+            "api_calls_used": int(workflow_payload.get("api_calls_used", 0)),
+            "max_api_calls": int(workflow_payload.get("max_api_calls", 0)),
+            "stopped_reason": str(workflow_payload.get("stopped_reason", "completed")),
+            "trace": safe_trace,
+            "created_at": now_iso,
+        }
+
+        try:
+            self._workflow_runs.insert_one(safe_doc)
+            return workflow_id
+        except (PyMongoError, TimeoutError) as exc:
+            raise DatabaseError(_format_mongo_error(exc, self._uri)) from exc
+
+    def load_workflow_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Load persisted multi-agent workflow runs (newest first)."""
+        bounded_limit = max(1, min(int(limit), 100))
+        runs: list[dict[str, Any]] = []
+        try:
+            cursor = self._workflow_runs.find({}).sort("created_at", DESCENDING).limit(bounded_limit)
+            for raw in cursor:
+                runs.append(
+                    {
+                        "workflow_id": str(raw.get("_id", "")),
+                        "task": str(raw["task"]),
+                        "model": str(raw["model"]),
+                        "route": str(raw.get("route", "direct_write")),
+                        "retrieval_mode": str(raw.get("retrieval_mode", "not_needed")),
+                        "fallback_notes": list(raw.get("fallback_notes", [])),
+                        "citations": list(raw.get("citations", [])),
+                        "final_response": str(raw["final_response"]),
+                        "steps_taken": int(raw.get("steps_taken", 0)),
+                        "max_steps": int(raw.get("max_steps", 0)),
+                        "api_calls_used": int(raw.get("api_calls_used", 0)),
+                        "max_api_calls": int(raw.get("max_api_calls", 0)),
+                        "stopped_reason": str(raw.get("stopped_reason", "completed")),
+                        "trace": list(raw.get("trace", [])),
+                        "created_at": str(raw.get("created_at", "")),
+                    }
+                )
+        except (PyMongoError, TimeoutError) as exc:
+            raise DatabaseError(_format_mongo_error(exc, self._uri)) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DatabaseError("Persisted workflow run record in MongoDB has an unexpected format.") from exc
 
         return runs
