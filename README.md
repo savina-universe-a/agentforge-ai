@@ -1,27 +1,27 @@
 # AgentForge AI
 
-A clean, modular AI agent platform built with Python, Streamlit, and the official `google-genai` SDK.
+A clean, modular AI agent platform built with Python, Streamlit, `google-genai`, local TF-IDF RAG, and MongoDB Atlas persistence.
 
-**Milestone 4** adds a local **Document RAG Knowledge Base** (`pypdf` + `scikit-learn` TF-IDF + Gemini grounded Q&A) alongside Milestone 2's **AI Planning** and Milestone 3's **Autonomous Tool-Calling Agent** (no vector database, Supabase, LangChain, or LangGraph yet).
+**Milestone 5** adds optional **MongoDB Atlas persistence** (`pymongo`) for Knowledge Base documents and autonomous agent activity history while keeping local session-only usage and local `scikit-learn` TF-IDF retrieval working seamlessly (no vector search or embeddings yet).
 
 ## Features by Milestone
 
 - **Milestone 1 — Dashboard Foundation:** Minimal Streamlit UI with `Overview`, `AI Agent`, `Knowledge Base`, and `Activity` navigation and baseline metrics.
 - **Milestone 2 — Gemini AI Planning:** Generates structured, prioritized action plans using `google-genai` and `python-dotenv` with private local `GEMINI_API_KEY` setup.
-- **Milestone 3 — Autonomous Tool-Calling Agent:** Runs a bounded (max 5 iterations) Gemini function-calling loop over three safe allowlisted Python tools (`calculate` via restricted AST parsing, `get_current_datetime`, and `create_action_plan`), displaying a transparent **Activity Log** and **Final Response**.
-- **Milestone 4 — Local Document RAG Knowledge Base:**
-  - Upload **PDF** and **TXT** files (up to 5 MB each; rejects empty, encrypted, binary, or unreadable files).
-  - Extracts text strictly in memory (`pypdf` for PDFs with page numbers preserved; UTF-8 for TXT) — **never writes uploaded documents to disk or Git**.
-  - Splits text into overlapping chunks with deterministic source IDs (`doc.pdf | Page 2 | Chunk 1` or `notes.txt | Chunk 1`).
-  - Indexes chunks locally in Streamlit session state using `scikit-learn` **TF-IDF + cosine similarity**.
-  - Retrieves only the top matching passages and instructs Gemini to answer **strictly from retrieved context**, cite sources inline, treat document content as untrusted data (prompt-injection protection), and explicitly say when documents do not contain the answer.
-  - Displays retrieved passages inside an expandable **Sources** section and provides a **Clear Knowledge Base** button.
+- **Milestone 3 — Autonomous Tool-Calling Agent:** Bounded (max 5 iterations) Gemini function-calling loop over three safe allowlisted Python tools (`calculate` via restricted AST parsing, `get_current_datetime`, and `create_action_plan`), showing an **Activity Log** and **Final Response**.
+- **Milestone 4 — Local Document RAG Knowledge Base:** In-memory PDF (`pypdf`) and TXT extraction with overlapping chunking, deterministic source IDs, local `scikit-learn` TF-IDF retrieval, prompt-injection defenses, inline citations, and expandable **Sources**.
+- **Milestone 5 — MongoDB Atlas Persistence (`pymongo`):**
+  - Connects via `MONGODB_URI` and `MONGODB_DB_NAME` (default `agentforge_ai`) from local `.env`.
+  - Saves document metadata, extracted page text, and exact chunk identifiers (`documents` collection) under stable document IDs (`doc:<slug>`) with duplicate detection — reloading into the local TF-IDF index preserves identical source names, page/chunk IDs, and retrieval scores.
+  - Persists completed autonomous agent run summaries and safe tool activity logs (`agent_runs` collection) without storing API keys, connection strings, or hidden reasoning.
+  - Gracefully falls back to session-only mode whenever `MONGODB_URI` is unset or Atlas is unreachable.
 
 ## Prerequisites
 
 - Windows 10/11
 - Python 3.11 or newer
-- A Google Gemini API key (from Google AI Studio) for live runs
+- A Google Gemini API key (from Google AI Studio) for live AI calls
+- *(Optional)* A MongoDB Atlas cluster URI for persistence across browser restarts
 
 ## Windows Setup (PowerShell)
 
@@ -29,7 +29,7 @@ A clean, modular AI agent platform built with Python, Streamlit, and the officia
    ```powershell
    python -m venv .venv
    ```
-   *(If you use the Python Launcher on Windows, you can run `py -3.11 -m venv .venv`.)*
+   *(Or `py -3.11 -m venv .venv` if using the Windows Python Launcher.)*
 
 2. **Activate the virtual environment**:
    ```powershell
@@ -42,15 +42,18 @@ A clean, modular AI agent platform built with Python, Streamlit, and the officia
    python -m pip install -r requirements.txt
    ```
 
-4. **Configure `GEMINI_API_KEY` privately (never paste your key in chat or commit it)**:
-   - **Option A — Local `.env` file (recommended):**
-     ```powershell
-     Copy-Item .env.example .env
-     notepad .env
-     ```
-     Paste your key after `GEMINI_API_KEY=` and save. `.env` is ignored by `.gitignore`.
-   - **Option B — Private sidebar input in the app:**
-     Start the app, open **API Key Setup (Private)** in the sidebar, paste your masked key, and click **Use Session** (memory only) or **Save to .env** (writes to your gitignored local `.env`).
+4. **Configure local `.env` privately (never paste secrets in chat or commit `.env`)**:
+   ```powershell
+   Copy-Item .env.example .env
+   notepad .env
+   ```
+   Set:
+   - `GEMINI_API_KEY=` — your private Gemini API key (or enter it privately in the sidebar under **API Key Setup (Private)**).
+   - `GEMINI_MODEL=gemini-3.5-flash-lite`
+   - `MONGODB_URI=` — *(optional)* your MongoDB Atlas SRV connection string (`mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=true&w=majority`).
+   - `MONGODB_DB_NAME=agentforge_ai`
+
+   *(In MongoDB Atlas, make sure your current IP address is allowed under **Network Access** and your database user has read/write permissions on `agentforge_ai`.)*
 
 5. **Run the Streamlit app**:
    ```powershell
@@ -63,44 +66,44 @@ A clean, modular AI agent platform built with Python, Streamlit, and the officia
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `GEMINI_API_KEY` | Yes (for live runs) | — | Your private Gemini API key |
-| `GEMINI_MODEL` | No | `gemini-3.5-flash-lite` | Available Gemini model used for AI planning, agent tool calling, and RAG Q&A |
+| `GEMINI_API_KEY` | Yes (for live AI calls) | — | Your private Gemini API key |
+| `GEMINI_MODEL` | No | `gemini-3.5-flash-lite` | Available Gemini model used across planning, agent, and RAG |
+| `MONGODB_URI` | No | — | MongoDB Atlas connection string (`mongodb+srv://...`); omit for session-only mode |
+| `MONGODB_DB_NAME` | No | `agentforge_ai` | MongoDB database name (`documents` and `agent_runs` collections) |
 
-## How to Test
+## How to Verify & Test
 
-### 1. Automated Tests (Mocked — Zero API Credits)
-
-All automated tests mock `google-genai` responses and verify Milestones 1–4 without making live API calls:
+### 1. Automated Tests (Mocked — Zero Live DB or Gemini API Calls)
 
 ```powershell
 python -m unittest discover -v
 ```
 
-### 2. Live Browser Tests
+### 2. Live MongoDB Atlas Persistence Test
 
-- **Document RAG (`Knowledge Base` tab):**
-  1. Upload a small `.txt` or `.pdf` file (e.g., project notes or a short policy document) and click **Index Uploaded Documents**.
-  2. Ask a question answered by the file and click **Ask Knowledge Base** — verify inline citations and expand **Sources** to inspect the retrieved passages.
-  3. Ask a completely unrelated question — verify the app explicitly states that the uploaded documents do not contain the answer.
-  4. Click **Clear Knowledge Base** to remove all documents and the TF-IDF index from session memory.
-- **Autonomous Agent (`Overview` or `AI Agent` tab):**
-  Enter a multi-step prompt (e.g., check today's date, calculate a cost expression, and create an action plan) and click **Run Autonomous Agent**.
+1. Add your `MONGODB_URI` and `MONGODB_DB_NAME=agentforge_ai` to your local `.env` file, then restart Streamlit (`python -m streamlit run app.py`).
+2. Open `http://localhost:8501` → **Knowledge Base** and click **Verify Connection** — confirm it reports connected to `agentforge_ai`.
+3. Upload and index a small `.txt` or `.pdf` file, click **Save to MongoDB**, then click **Clear Knowledge Base** (or reload the browser tab).
+4. Click **Load from MongoDB** and ask a question about the document — confirm the reloaded citations (`doc | Chunk 1` or `doc | Page X | Chunk Y`) and **Sources** match identically.
+5. Run one prompt in **Autonomous Agent (Tool Calling)**, then refresh the browser, open **Activity**, and click **Load Saved Activity from MongoDB** to confirm the run summary and tool log persisted.
 
 ## Project Structure
 
 ```text
 agentforge-ai/
-├── app.py            # Streamlit dashboard (AI Planning, Autonomous Agent, Knowledge Base, Activity)
-├── rag.py            # Local in-memory PDF/TXT extraction, overlapping chunking, TF-IDF & Gemini RAG
+├── app.py            # Streamlit dashboard (Planning, Agent, Knowledge Base, Activity)
+├── database.py       # MongoDB Atlas persistence wrapper (pymongo, connection check, CRUD)
+├── rag.py            # Local in-memory PDF/TXT extraction, chunking, TF-IDF & Gemini RAG
 ├── agent.py          # Bounded Gemini function-calling agent loop (max 5 iterations)
 ├── tools.py          # Safe allowlisted Python tools (AST calculate, datetime, action plan)
 ├── planner.py        # Standalone Gemini AI planning service
-├── test_app.py       # Streamlit AppTest UI verification tests (mocked Gemini)
-├── test_rag.py       # Document extraction, chunking, TF-IDF retrieval & RAG tests (mocked Gemini)
-├── test_agent.py     # Safe tools & autonomous agent loop unit tests (mocked Gemini)
-├── test_planner.py   # Planner unit tests (mocked Gemini, dotenv, error handling)
-├── requirements.txt  # Python dependencies (streamlit, google-genai, python-dotenv, pypdf, scikit-learn)
+├── test_app.py       # Streamlit AppTest UI tests (mocked Gemini & MongoDB)
+├── test_database.py  # MongoDB Atlas persistence, reload parity & error-handling tests (mocked)
+├── test_rag.py       # Document extraction, chunking, TF-IDF retrieval & RAG tests (mocked)
+├── test_agent.py     # Safe tools & autonomous agent loop unit tests (mocked)
+├── test_planner.py   # Planner unit tests (mocked)
+├── requirements.txt  # Python dependencies
 ├── .env.example      # Template for local environment variables (no secrets)
 ├── .gitignore        # Excludes .venv, caches, .env, secrets, and local DB files
-└── README.md         # Setup, architecture, and testing instructions
+└── README.md         # Setup, architecture, and verification instructions
 ```

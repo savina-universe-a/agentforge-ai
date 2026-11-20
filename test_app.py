@@ -12,9 +12,11 @@ from unittest.mock import MagicMock, patch
 from streamlit.testing.v1 import AppTest
 
 import agent
+import database
 import planner
 import rag
 from test_agent import _make_function_call_response, _make_text_response
+from test_database import _FakeMongoClient
 
 
 MOCK_PLAN = planner.ActionPlan(
@@ -200,6 +202,7 @@ class TestAgentForgeApp(unittest.TestCase):
         with (
             patch.dict(os.environ, {"GEMINI_API_KEY": "mock-secret-key-xyz"}, clear=False),
             patch("agent.genai.Client", return_value=mock_client),
+            patch("database.is_mongodb_configured", return_value=False),
         ):
             at = AppTest.from_file("app.py").run()
             at.text_input(key="autonomous_goal").input("Compute 18 * 5").run()
@@ -229,6 +232,7 @@ class TestAgentForgeApp(unittest.TestCase):
         with (
             patch.dict(os.environ, {"GEMINI_API_KEY": "mock-secret-key-xyz"}, clear=False),
             patch("agent.genai.Client", return_value=mock_client),
+            patch("database.is_mongodb_configured", return_value=False),
         ):
             at = AppTest.from_file("app.py").run()
             at.text_input(key="autonomous_goal").input("Compute 18 * 5").run()
@@ -309,6 +313,97 @@ class TestAgentForgeApp(unittest.TestCase):
         self.assertFalse(at.exception)
         self.assertEqual(len(at.warning), 1)
         self.assertIn("do not contain", at.warning[0].value.lower())
+
+    def test_knowledge_base_mongodb_save_clear_and_reload_flow(self) -> None:
+        fake_mongo_client = _FakeMongoClient()
+
+        kb_index = rag.KnowledgeBaseIndex()
+        kb_index.add_document(
+            "sla.txt",
+            b"Support SLA: Priority 1 incidents receive an initial response within 2 hours.",
+        )
+
+        with (
+            patch.dict(
+                os.environ,
+                {"MONGODB_URI": "mongodb+srv://user:pass@cluster0.example.mongodb.net/"},
+                clear=False,
+            ),
+            patch("database.MongoClient", return_value=fake_mongo_client),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.session_state["kb_index"] = kb_index
+            at.sidebar.radio[0].set_value("Knowledge Base").run()
+
+            # Save indexed document to mocked MongoDB Atlas
+            at.button(key="kb_mongo_save_btn").click().run()
+            self.assertFalse(at.exception)
+            self.assertTrue(any("saved 1 new" in s.value.lower() for s in at.success))
+
+            # Clear session Knowledge Base
+            at.button(key="kb_clear_btn").click().run()
+            self.assertEqual(at.session_state["kb_index"].document_count, 0)
+
+            # Reload saved document from MongoDB Atlas into local TF-IDF index
+            at.button(key="kb_mongo_load_btn").click().run()
+            self.assertFalse(at.exception)
+            self.assertEqual(at.session_state["kb_index"].document_count, 1)
+            hits = at.session_state["kb_index"].retrieve("Priority 1 SLA response time")
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0].chunk.citation_label, "sla.txt | Chunk 1")
+
+    def test_knowledge_base_session_mode_handles_missing_mongodb_uri_gracefully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            missing_env = Path(tmp_dir) / ".env"
+            with (
+                patch.object(planner, "ENV_FILE", missing_env),
+                patch.dict(os.environ, {"MONGODB_URI": ""}, clear=False),
+            ):
+                at = AppTest.from_file("app.py").run()
+                at.sidebar.radio[0].set_value("Knowledge Base").run()
+                at.button(key="kb_mongo_verify_btn").click().run()
+
+        self.assertFalse(at.exception)
+        self.assertTrue(any("MONGODB_URI" in w.value for w in at.warning))
+
+    def test_autonomous_agent_persists_run_and_activity_view_reloads_it(self) -> None:
+        fake_mongo_client = _FakeMongoClient()
+
+        mock_gemini = MagicMock()
+        mock_gemini.models.generate_content.side_effect = [
+            _make_function_call_response([("calculate", {"expression": "10 * 7"})]),
+            _make_text_response("10 multiplied by 7 equals 70."),
+        ]
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GEMINI_API_KEY": "mock-secret-key",
+                    "MONGODB_URI": "mongodb+srv://user:pass@cluster0.example.mongodb.net/",
+                },
+                clear=False,
+            ),
+            patch("agent.genai.Client", return_value=mock_gemini),
+            patch("database.MongoClient", return_value=fake_mongo_client),
+        ):
+            at = AppTest.from_file("app.py").run()
+            at.text_input(key="autonomous_goal").input("Compute 10 * 7").run()
+            at.button(key="run_agent_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertTrue(any("saved to mongodb atlas" in s.value.lower() for s in at.success))
+
+            # Simulate a fresh session by clearing in-memory history, then reload from Activity page
+            at.session_state["activity_history"] = []
+            at.sidebar.radio[0].set_value("Activity").run()
+            at.button(key="activity_mongo_load_btn").click().run()
+
+            self.assertFalse(at.exception)
+            self.assertEqual(len(at.session_state["activity_history"]), 1)
+            rendered_markdown = "\n".join(m.value for m in at.markdown)
+            self.assertIn("10 * 7 = 70", rendered_markdown)
+            self.assertIn("10 multiplied by 7 equals 70.", rendered_markdown)
 
 
 if __name__ == "__main__":

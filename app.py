@@ -1,4 +1,4 @@
-"""AgentForge AI — Milestone 4 Streamlit dashboard (Planning, Autonomous Agent & Local RAG)."""
+"""AgentForge AI — Milestone 5 Streamlit dashboard (Planning, Agent, Local RAG & MongoDB Atlas)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,13 @@ from agent import (
     AgentError,
     AgentRunResult,
     run_autonomous_agent,
+)
+from database import (
+    DatabaseConfigError,
+    DatabaseError,
+    MongoPersistence,
+    get_mongodb_db_name,
+    is_mongodb_configured,
 )
 from planner import (
     ActionPlan,
@@ -55,10 +62,10 @@ def _get_kb_index() -> KnowledgeBaseIndex:
 
 
 def render_sidebar() -> str:
-    """Render sidebar navigation and private local API key controls."""
+    """Render sidebar navigation, private API key controls, and persistence status."""
     with st.sidebar:
         st.markdown("## AgentForge AI")
-        st.caption("Milestone 4 · Planning, Agent & Document RAG")
+        st.caption("Milestone 5 · Atlas Persistence & Local RAG")
         st.divider()
 
         selection = st.radio(
@@ -76,6 +83,11 @@ def render_sidebar() -> str:
             st.caption(f"Gemini API: Ready (`{model_name}`)")
         else:
             st.caption("Gemini API: GEMINI_API_KEY not configured")
+
+        if is_mongodb_configured():
+            st.caption(f"MongoDB Atlas: Configured (`{get_mongodb_db_name()}`)")
+        else:
+            st.caption("MongoDB Atlas: Session-only mode")
 
         with st.expander("API Key Setup (Private)", expanded=False):
             st.caption(
@@ -201,6 +213,23 @@ def render_autonomous_agent_controls(
                     )
                     history.insert(0, result)
                     st.session_state["activity_history"] = history
+
+                    # Persist summary & tool activity log to MongoDB Atlas when configured
+                    st.session_state.pop("agent_persistence_notice", None)
+                    if is_mongodb_configured():
+                        try:
+                            with MongoPersistence() as db:
+                                db.save_agent_run(result)
+                            st.session_state["agent_persistence_notice"] = (
+                                "success",
+                                f"Run summary and tool activity saved to MongoDB Atlas (`{get_mongodb_db_name()}`).",
+                            )
+                        except (DatabaseConfigError, DatabaseError) as db_exc:
+                            st.session_state["agent_persistence_notice"] = (
+                                "warning",
+                                f"Run completed locally, but MongoDB save failed: {db_exc}",
+                            )
+
                     st.rerun()
                 except MissingAPIKeyError as exc:
                     st.warning(str(exc))
@@ -208,6 +237,14 @@ def render_autonomous_agent_controls(
                     st.warning(str(exc))
                 except AgentError as exc:
                     st.error(str(exc))
+
+    notice = st.session_state.get("agent_persistence_notice")
+    if isinstance(notice, tuple) and len(notice) == 2:
+        level, msg = notice
+        if level == "success":
+            st.success(msg)
+        else:
+            st.warning(msg)
 
     last_result = st.session_state.get("last_agent_result")
     if isinstance(last_result, AgentRunResult):
@@ -327,15 +364,15 @@ def render_ai_agent_view() -> None:
 
 
 def render_knowledge_base_view() -> None:
-    """Render the Milestone 4 local TF-IDF Document RAG Knowledge Base view."""
+    """Render the local TF-IDF Document RAG Knowledge Base with optional MongoDB Atlas persistence."""
     kb_index = _get_kb_index()
 
     with st.container(border=True):
         st.subheader("Knowledge Base")
         if kb_index.document_count == 0:
             st.info(
-                "No documents uploaded yet. Upload PDF or TXT files below to build an "
-                "in-memory TF-IDF knowledge base for this session (files are never written to disk)."
+                "No documents loaded yet. Upload PDF or TXT files below (or load previously "
+                "saved documents from MongoDB Atlas) to build the local TF-IDF retrieval index."
             )
         else:
             col_summary, col_clear = st.columns([3, 1])
@@ -349,6 +386,7 @@ def render_knowledge_base_view() -> None:
                     kb_index.clear()
                     st.session_state.pop("kb_last_answer", None)
                     st.session_state.pop("kb_upload_feedback", None)
+                    st.session_state.pop("kb_mongo_feedback", None)
                     st.session_state["kb_uploader_nonce"] = (
                         st.session_state.get("kb_uploader_nonce", 0) + 1
                     )
@@ -364,11 +402,106 @@ def render_knowledge_base_view() -> None:
     st.write("")
 
     with st.container(border=True):
+        st.markdown("#### MongoDB Atlas Persistence")
+        if is_mongodb_configured():
+            st.caption(
+                f"Configured database: `{get_mongodb_db_name()}` · "
+                "Save indexed documents to Atlas or reload saved documents into local TF-IDF retrieval."
+            )
+        else:
+            st.caption(
+                "Session-only mode: add `MONGODB_URI` to your local `.env` file to enable "
+                "saving and reloading documents in MongoDB Atlas."
+            )
+
+        col_verify, col_save, col_load = st.columns(3)
+        with col_verify:
+            if st.button("Verify Connection", key="kb_mongo_verify_btn", use_container_width=True):
+                try:
+                    with st.spinner("Checking MongoDB Atlas connection..."):
+                        with MongoPersistence() as db:
+                            info = db.verify_connection()
+                    st.session_state["kb_mongo_feedback"] = (
+                        "success",
+                        f"Connected to MongoDB Atlas database `{info['database']}`.",
+                    )
+                except DatabaseConfigError as exc:
+                    st.session_state["kb_mongo_feedback"] = ("warning", str(exc))
+                except DatabaseError as exc:
+                    st.session_state["kb_mongo_feedback"] = ("error", str(exc))
+
+        with col_save:
+            if st.button("Save to MongoDB", key="kb_mongo_save_btn", use_container_width=True):
+                if kb_index.document_count == 0:
+                    st.session_state["kb_mongo_feedback"] = (
+                        "warning",
+                        "Upload and index at least one document before saving to MongoDB.",
+                    )
+                else:
+                    try:
+                        with st.spinner("Saving indexed documents to MongoDB Atlas..."):
+                            with MongoPersistence() as db:
+                                summary = db.save_knowledge_base(kb_index)
+                        parts = []
+                        if summary["inserted"]:
+                            parts.append(f"saved {len(summary['inserted'])} new")
+                        if summary["updated"]:
+                            parts.append(f"updated {len(summary['updated'])}")
+                        if summary["duplicates"]:
+                            parts.append(f"skipped {len(summary['duplicates'])} unchanged duplicate(s)")
+                        detail = ", ".join(parts) if parts else "no changes"
+                        st.session_state["kb_mongo_feedback"] = (
+                            "success",
+                            f"MongoDB sync complete: {detail}.",
+                        )
+                    except DatabaseConfigError as exc:
+                        st.session_state["kb_mongo_feedback"] = ("warning", str(exc))
+                    except DatabaseError as exc:
+                        st.session_state["kb_mongo_feedback"] = ("error", str(exc))
+
+        with col_load:
+            if st.button("Load from MongoDB", key="kb_mongo_load_btn", use_container_width=True):
+                try:
+                    with st.spinner("Loading saved documents from MongoDB Atlas..."):
+                        with MongoPersistence() as db:
+                            bundles = db.load_documents()
+                    loaded = kb_index.load_persisted_documents(bundles)
+                    st.session_state.pop("kb_last_answer", None)
+                    if loaded == 0:
+                        st.session_state["kb_mongo_feedback"] = (
+                            "warning",
+                            "No saved documents found in MongoDB Atlas yet.",
+                        )
+                    else:
+                        st.session_state["kb_mongo_feedback"] = (
+                            "success",
+                            f"Loaded {loaded} document(s) ({kb_index.chunk_count} chunk(s)) "
+                            "into the local TF-IDF retrieval index.",
+                        )
+                        st.rerun()
+                except DatabaseConfigError as exc:
+                    st.session_state["kb_mongo_feedback"] = ("warning", str(exc))
+                except DatabaseError as exc:
+                    st.session_state["kb_mongo_feedback"] = ("error", str(exc))
+
+        mongo_feedback = st.session_state.get("kb_mongo_feedback")
+        if isinstance(mongo_feedback, tuple) and len(mongo_feedback) == 2:
+            level, msg = mongo_feedback
+            if level == "success":
+                st.success(msg)
+            elif level == "warning":
+                st.warning(msg)
+            else:
+                st.error(msg)
+
+    st.write("")
+
+    with st.container(border=True):
         st.markdown("#### Upload Documents")
         max_mb = MAX_FILE_SIZE_BYTES / (1024 * 1024)
         st.caption(
-            f"Upload PDF or TXT files (max {max_mb:.0f} MB each). Text and retrieval index live "
-            "only in your browser session memory."
+            f"Upload PDF or TXT files (max {max_mb:.0f} MB each). Uploaded files are extracted "
+            "in memory and never written to local disk or Git."
         )
 
         uploader_nonce = st.session_state.get("kb_uploader_nonce", 0)
@@ -452,16 +585,47 @@ def render_knowledge_base_view() -> None:
 
 
 def render_activity_view() -> None:
-    """Render the Activity view showing autonomous agent runs from the current session."""
+    """Render the Activity view showing session and optionally persisted MongoDB agent runs."""
     history: list[AgentRunResult] = st.session_state.get("activity_history", [])
     with st.container(border=True):
         st.subheader("Activity")
         if not history:
             st.info(
-                "No autonomous agent runs recorded in this session yet. "
-                "Run the Autonomous Agent from Overview or AI Agent to see tool activity here."
+                "No autonomous agent runs loaded in this session yet. "
+                "Run the Autonomous Agent or load saved activity from MongoDB Atlas below."
             )
-            return
+
+        if st.button("Load Saved Activity from MongoDB", key="activity_mongo_load_btn"):
+            try:
+                with st.spinner("Loading saved agent activity from MongoDB Atlas..."):
+                    with MongoPersistence() as db:
+                        saved_runs = db.load_agent_runs(limit=20)
+                if not saved_runs:
+                    st.session_state["activity_mongo_feedback"] = (
+                        "warning",
+                        "No saved agent runs found in MongoDB Atlas yet.",
+                    )
+                else:
+                    st.session_state["activity_history"] = saved_runs
+                    st.session_state["activity_mongo_feedback"] = (
+                        "success",
+                        f"Loaded {len(saved_runs)} saved agent run(s) from MongoDB Atlas.",
+                    )
+                    st.rerun()
+            except DatabaseConfigError as exc:
+                st.session_state["activity_mongo_feedback"] = ("warning", str(exc))
+            except DatabaseError as exc:
+                st.session_state["activity_mongo_feedback"] = ("error", str(exc))
+
+        activity_feedback = st.session_state.get("activity_mongo_feedback")
+        if isinstance(activity_feedback, tuple) and len(activity_feedback) == 2:
+            level, msg = activity_feedback
+            if level == "success":
+                st.success(msg)
+            elif level == "warning":
+                st.warning(msg)
+            else:
+                st.error(msg)
 
     for run in history:
         st.write("")
@@ -481,7 +645,8 @@ def main() -> None:
 
     st.title("AgentForge AI")
     st.caption(
-        "AI agent platform for Gemini AI planning, autonomous tool calling, and local document RAG."
+        "AI agent platform for Gemini planning, autonomous tool calling, local TF-IDF RAG, "
+        "and MongoDB Atlas persistence."
     )
     st.divider()
 

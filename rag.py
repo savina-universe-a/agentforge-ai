@@ -316,6 +316,7 @@ class KnowledgeBaseIndex:
     def __init__(self) -> None:
         self.documents: list[DocumentRecord] = []
         self.chunks: list[DocumentChunk] = []
+        self._pages_by_doc: dict[str, list[ExtractedPage]] = {}
         self._vectorizer: TfidfVectorizer | None = None
         self._tfidf_matrix: Any = None
 
@@ -331,6 +332,7 @@ class KnowledgeBaseIndex:
         """Remove all documents, chunks, and TF-IDF state from memory."""
         self.documents = []
         self.chunks = []
+        self._pages_by_doc = {}
         self._vectorizer = None
         self._tfidf_matrix = None
 
@@ -399,8 +401,40 @@ class KnowledgeBaseIndex:
         )
         self.documents.append(record)
         self.chunks.extend(new_chunks)
+        self._pages_by_doc[doc_name] = pages
         self._rebuild_index()
         return record
+
+    def get_document_bundle(
+        self, doc_name: str
+    ) -> tuple[DocumentRecord, list[DocumentChunk], list[ExtractedPage]]:
+        """Return a document's metadata, exact chunks, and extracted pages for persistence."""
+        for doc in self.documents:
+            if doc.doc_name == doc_name:
+                doc_chunks = [chunk for chunk in self.chunks if chunk.doc_name == doc_name]
+                doc_pages = list(self._pages_by_doc.get(doc_name, []))
+                return doc, doc_chunks, doc_pages
+        raise KeyError(f"Document '{doc_name}' is not in the current Knowledge Base.")
+
+    def load_persisted_documents(
+        self,
+        bundles: list[tuple[DocumentRecord, list[DocumentChunk], list[ExtractedPage]]],
+    ) -> int:
+        """Load persisted documents and exact chunks into memory and rebuild local TF-IDF."""
+        loaded_count = 0
+        for record, doc_chunks, doc_pages in bundles:
+            if not doc_chunks:
+                continue
+            self.documents = [doc for doc in self.documents if doc.doc_name != record.doc_name]
+            self.chunks = [chunk for chunk in self.chunks if chunk.doc_name != record.doc_name]
+            self.documents.append(record)
+            self.chunks.extend(doc_chunks)
+            self._pages_by_doc[record.doc_name] = list(doc_pages)
+            loaded_count += 1
+
+        if loaded_count > 0:
+            self._rebuild_index()
+        return loaded_count
 
     def retrieve(
         self,
